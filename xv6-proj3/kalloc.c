@@ -23,9 +23,10 @@ struct {
   struct run *freelist;
 } kmem;
 
+// [CoW] 定义用于引用计数的结构
 struct {
   int num_free_pages;
-  uint refcount[PHYSTOP >> PGSHIFT];
+  uint refcount[PHYSTOP >> PGSHIFT]; // 引用计数数组
 } pmem;
 
 // Initialization happens in two phases.
@@ -46,6 +47,7 @@ kinit2(void *vstart, void *vend)
 {
   freerange(vstart, vend);
   kmem.use_lock = 1;
+  // [CoW] 初始化引用计数为 0
   memset(&pmem.refcount, 0, sizeof(uint) * (PHYSTOP >> PGSHIFT));
   pmem.num_free_pages = 0;
 }
@@ -67,15 +69,35 @@ void
 kfree(char *v)
 {
   struct run *r;
+  uint pa;
 
   if((uint)v % PGSIZE || v < end || V2P(v) >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
-  memset(v, 1, PGSIZE);
-
+  // [CoW] 获取锁（如果系统已初始化）
   if(kmem.use_lock)
     acquire(&kmem.lock);
+  
+  pa = V2P(v);
+  
+  // [CoW] 检查引用计数
+  // 如果引用计数大于 1，说明还有其他进程在使用该页，
+  // 我们只递减计数，不真正释放内存。
+  if(pmem.refcount[pa >> PGSHIFT] > 1) {
+    pmem.refcount[pa >> PGSHIFT]--;
+    if(kmem.use_lock)
+      release(&kmem.lock);
+    return; 
+  }
+
+  // 如果代码运行到这里，说明引用计数为 1 (或 0，如果是初始化阶段)，
+  // 我们可以真正释放该页了。
+  pmem.refcount[pa >> PGSHIFT] = 0;
+
+  // Fill with junk to catch dangling refs.
+  // [CoW] 注意：必须在确定要释放后才填垃圾数据
+  memset(v, 1, PGSIZE);
+
   r = (struct run*)v;
   r->next = kmem.freelist;
   kmem.freelist = r;
@@ -97,9 +119,12 @@ kalloc(void)
   if(kmem.use_lock)
     acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  if(r) {
     kmem.freelist = r->next;
-
+    // [CoW] 分配新页时，引用计数设为 1
+    pmem.refcount[V2P((char*)r) >> PGSHIFT] = 1;
+  }
+    
   pmem.num_free_pages--;
 
   if(kmem.use_lock)
@@ -113,20 +138,31 @@ freemem(void)
   return pmem.num_free_pages;
 }
 
+// [CoW] 获取物理地址 pa 的引用计数
 uint
 get_refcount(uint pa)
 {
-  return 0;
+  uint count;
+  if(kmem.use_lock) acquire(&kmem.lock);
+  count = pmem.refcount[pa >> PGSHIFT];
+  if(kmem.use_lock) release(&kmem.lock);
+  return count;
 }
 
+// [CoW] 增加物理地址 pa 的引用计数
 void
 inc_refcount(uint pa)
 {
-  return;
+  if(kmem.use_lock) acquire(&kmem.lock);
+  pmem.refcount[pa >> PGSHIFT]++;
+  if(kmem.use_lock) release(&kmem.lock);
 }
 
+// [CoW] 减少物理地址 pa 的引用计数
 void  
 dec_refcount(uint pa)
 {
-  return;
+  if(kmem.use_lock) acquire(&kmem.lock);
+  pmem.refcount[pa >> PGSHIFT]--;
+  if(kmem.use_lock) release(&kmem.lock);
 }
