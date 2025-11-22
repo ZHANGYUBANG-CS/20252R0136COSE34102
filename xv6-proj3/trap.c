@@ -47,9 +47,10 @@ trap(struct trapframe *tf)
   }
 
   switch(tf->trapno){
-  case T_PGFLT:
+  case T_PGFLT: // [CoW] 添加缺页中断处理
     page_fault();
     break;
+
   case T_IRQ0 + IRQ_TIMER:
     if(cpuid() == 0){
       acquire(&tickslock);

@@ -10,6 +10,11 @@
 extern char data[];  // defined by kernel.ld
 pde_t *kpgdir;  // for use in scheduler()
 
+// [CoW] 声明 kalloc.c 中的外部函数
+extern void inc_refcount(uint pa);
+extern void dec_refcount(uint pa);
+extern uint get_refcount(uint pa);
+
 // Set up CPU's kernel segment descriptors.
 // Run once on entry on each CPU.
 void
@@ -93,7 +98,7 @@ mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm)
 //   KERNBASE+EXTMEM..data: mapped to EXTMEM..V2P(data)
 //                for the kernel's instructions and r/o data
 //   data..KERNBASE+PHYSTOP: mapped to V2P(data)..PHYSTOP,
-//                                  rw data + free physical memory
+//                                   rw data + free physical memory
 //   0xfe000000..0: mapped direct (devices such as ioapic)
 //
 // The kernel allocates physical memory for its heap and for user memory
@@ -310,6 +315,7 @@ clearpteu(pde_t *pgdir, char *uva)
   *pte &= ~PTE_U;
 }
 
+// [CoW] 完全重写 copyuvm
 // Given a parent process's page table, create a copy
 // of it for a child.
 pde_t*
@@ -318,7 +324,7 @@ copyuvm(pde_t *pgdir, uint sz)
   pde_t *d;
   pte_t *pte;
   uint pa, i, flags;
-  char *mem;
+  // char *mem; // CoW 不需要分配新内存
 
   if((d = setupkvm()) == 0)
     return 0;
@@ -327,16 +333,31 @@ copyuvm(pde_t *pgdir, uint sz)
       panic("copyuvm: pte should exist");
     if(!(*pte & PTE_P))
       panic("copyuvm: page not present");
+    
     pa = PTE_ADDR(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto bad;
-    memmove(mem, (char*)P2V(pa), PGSIZE);
-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
-      kfree(mem);
+
+    // [CoW 核心逻辑]
+    // 1. 清除父进程页表项的写权限 (PTE_W)
+    if(flags & PTE_W) {
+        *pte &= ~PTE_W; 
+        flags &= ~PTE_W; // 准备将只读标记赋给子进程
+    }
+    
+    // 2. 将子进程映射到同一个物理地址 (pa)，并设为只读
+    if(mappages(d, (void*)i, PGSIZE, pa, flags) < 0) {
       goto bad;
     }
+    
+    // 3. 增加该物理页的引用计数
+    inc_refcount(pa);
   }
+  
+  // [CoW 重要]
+  // 因为我们修改了父进程的页表权限（去掉了 PTE_W），
+  // 必须刷新 TLB，否则 CPU 缓存中可能还保留着"可写"的状态。
+  lcr3(V2P(pgdir));
+  
   return d;
 
 bad:
@@ -385,22 +406,68 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
   return 0;
 }
 
+// [CoW] 缺页中断处理
 void
 page_fault(void)
 {
-  uint va = rcr2();
-  if(va < 0) {
-    panic("Invalid access");
-    return;
+  struct proc *curproc = myproc();
+  uint va = rcr2(); // 获取导致异常的虚拟地址
+  pte_t *pte;
+  uint pa;
+  char *mem;
+
+  // 1. 检查地址合法性
+  // 必须在用户空间 ( < KERNBASE )
+  if(va >= KERNBASE) {
+      cprintf("Segmentation Fault (Kernel Space)\n");
+      curproc->killed = 1;
+      return;
   }
-  
-  return;
+
+  // 2. 检查页表项是否存在
+  // 对齐到页面边界
+  pte = walkpgdir(curproc->pgdir, (void*)va, 0);
+  if(!pte || !(*pte & PTE_P) || !(*pte & PTE_U)) {
+      cprintf("Segmentation Fault (Page Not Present)\n");
+      curproc->killed = 1;
+      return;
+  }
+
+  // 3. 检查是否是因为写了只读页 (CoW)
+  // 如果 PTE 已经是 PTE_W，说明不是 CoW 引起的，而是其他奇怪的错误
+  if(*pte & PTE_W) {
+      cprintf("Segmentation Fault (Unknown)\n");
+      curproc->killed = 1;
+      return;
+  }
+
+  pa = PTE_ADDR(*pte);
+
+  // 4. 处理逻辑
+  if(get_refcount(pa) > 1) {
+      // 情况 A: 共享页，需要 Copy
+      if((mem = kalloc()) == 0) {
+          cprintf("CoW: Out of Memory\n");
+          curproc->killed = 1; // 内存不足，杀掉进程
+          return;
+      }
+      
+      // 复制旧页内容到新页
+      memmove(mem, (char*)P2V(pa), PGSIZE);
+      
+      // 更新页表：指向新物理地址，开启写权限 (PTE_W)
+      *pte = V2P(mem) | PTE_P | PTE_W | PTE_U;
+      
+      // 减少原物理页引用计数
+      dec_refcount(pa);
+  } 
+  else {
+      // 情况 B: 独占页 (refcount == 1)
+      // 不需要复制，直接恢复写权限即可
+      *pte |= PTE_W;
+  }
+
+  // 5. 刷新 TLB
+  // 修改了当前进程的页表，必须重新加载 CR3
+  lcr3(V2P(curproc->pgdir));
 }
-
-//PAGEBREAK!
-// Blank page.
-//PAGEBREAK!
-// Blank page.
-//PAGEBREAK!
-// Blank page.
-
